@@ -156,7 +156,7 @@ def resume_from_checkpoint(
  
     # For LORA
     checkpoint_dir = os.path.dirname(filename)
-    
+
 
     weights_path = os.path.join(checkpoint_dir, "adapter_model.bin")
     if not os.path.exists(weights_path):
@@ -384,7 +384,7 @@ if __name__ == "__main__":
     parser.add_argument('--project_name', type=str, default='Qwen-Finetune', help="WandB project name")
     parser.add_argument('--dataset_path', type=str, default='my_data.jsonl', help="Path to training dataset (JSONL format)")
     parser.add_argument('--model_id', type=str, default='Qwen/Qwen2.5-7B-Instruct', help="Hugging Face model ID")
-    parser.add_argument('--resume', type=str, default=None, help="Path to checkpoint state to resume from")
+    parser.add_argument('--resume', type=str, default=None, help="checkpoint folder")
     parser.add_argument('--batch_size', type=int, default=4, help="Batch size per device")
     parser.add_argument('--num_workers', type=int, default=4, help="Number of data loader workers")
 
