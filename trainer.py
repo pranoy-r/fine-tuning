@@ -8,6 +8,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from dataloader import get_qwen_dataloaders
+from peft import set_peft_model_state_dict
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import _LRScheduler
+from typing import Optional, Union, Dict, Any
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from accelerate import Accelerator
 import wandb
@@ -23,9 +29,16 @@ from peft import (
     get_peft_model, 
     prepare_model_for_kbit_training
 )
-
 @torch.no_grad()
-def sample_generations(model, val_loader, tokenizer, accelerator, device, global_step, num_samples=2):
+def sample_generations(
+    model: nn.Module, 
+    val_loader: DataLoader, 
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast], 
+    accelerator: Accelerator, 
+    device: torch.device, 
+    global_step: int, 
+    num_samples: int = 2
+) -> None:
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.eval()
     logging.info(f"[Step {global_step}] Sampling text generations...")
@@ -70,7 +83,13 @@ def sample_generations(model, val_loader, tokenizer, accelerator, device, global
 
 
 @torch.no_grad()
-def validate(model, val_loader, accelerator, device, global_step):
+def validate(
+    model: nn.Module, 
+    val_loader: DataLoader, 
+    accelerator: Accelerator, 
+    device: torch.device, 
+    global_step: int
+) -> float:
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.eval()
     
@@ -109,22 +128,62 @@ def validate(model, val_loader, accelerator, device, global_step):
     return avg_loss
 
 
-def resume_from_checkpoint(device, filename, model, optim, scheduler):
+def resume_from_checkpoint(
+    device: torch.device, 
+    path: str,  
+    model: nn.Module, 
+    optim: Optimizer, 
+    scheduler: Optional[_LRScheduler]
+    ) -> int:
 
+   
+    if os.path.isdir(path):
+        filename = os.path.join(path, "training_state.pth")
+    else:
+        filename = path
+
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Could not find checkpoint file: {filename}")
+
+    
     checkpoint = torch.load(filename, map_location=device, weights_only=False)
     global_step = checkpoint['step']
     
-
     optim.load_state_dict(checkpoint['optimizer_state_dict'])
-
     if scheduler is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+ 
+    # For LORA
+    checkpoint_dir = os.path.dirname(filename)
     
-    logging.info(f"Resumed optimizer/scheduler state from checkpoint: {filename} at step {global_step}")
+
+    weights_path = os.path.join(checkpoint_dir, "adapter_model.bin")
+    if not os.path.exists(weights_path):
+        weights_path = os.path.join(checkpoint_dir, "adapter_model.safetensors")
+
+    if os.path.exists(weights_path):
+        # Load weights and inject them into the model
+        adapters_weights = torch.load(weights_path, map_location=device)
+        set_peft_model_state_dict(model, adapters_weights)
+        logging.info(f"Successfully resumed LoRA weights from {weights_path}")
+    else:
+        logging.warning(f"No adapter weights found in {checkpoint_dir}. Model remains in base state.")
+    
+    logging.info(f"Resumed optimizer/scheduler state from: {filename} at step {global_step}")
     return global_step
 
 
-def save_ckpt(accelerator, model, optim, scheduler, global_step, ckpt_saved_dir, save_intermediate_models):
+def save_ckpt(
+    accelerator: Accelerator, 
+    model: nn.Module, 
+    optim: Optimizer, 
+    scheduler: Optional[_LRScheduler], 
+    global_step: int, 
+    ckpt_saved_dir: str, 
+    save_intermediate_models: bool = False
+    ) -> None:
+    
     unwrapped_model = accelerator.unwrap_model(model)
     
     if not save_intermediate_models:
@@ -155,11 +214,11 @@ class QwenTrainer:
     def __init__(
         self, 
         model: nn.Module,
-        tokenizer,
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         train_dl: DataLoader,
         val_dl: DataLoader,
-        optim: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler._LRScheduler,
+        optim: Optimizer,
+        scheduler: Optional[_LRScheduler],
         num_epochs: int = 3,
         batch_size: int = 4,
         gradient_accumulation_steps: int = 4,
@@ -169,8 +228,8 @@ class QwenTrainer:
         sample_every: int = 250,    
         save_intermediate_models: bool = False,
         ckpt_saved_dir: str = 'ckpt',
-        resume: str | None = None,
-        accelerator_kwargs: dict | None = None
+        resume: Optional[str] = None,
+        accelerator_kwargs: Optional[Dict[str, Any]] = None
     ):
         self.global_step = 0
 
@@ -189,7 +248,11 @@ class QwenTrainer:
         self.tokenizer = tokenizer
         
         if resume:
-            self.global_step = resume_from_checkpoint(device, resume, self.model, self.optim, self.scheduler)
+            self.global_step = resume_from_checkpoint(device,
+                                                    resume,
+                                                    self.accelerator.unwrap_model(model),
+                                                    self.optim,
+                                                    self.scheduler)
 
         effective_steps_per_epoch = math.ceil(len(self.train_dl) / gradient_accumulation_steps)
         effective_training_steps = num_epochs * effective_steps_per_epoch
@@ -198,7 +261,7 @@ class QwenTrainer:
         logging.info(f"Effective steps per epoch: {effective_steps_per_epoch}")
         logging.info(f"Effective Total training steps: {effective_training_steps}")
 
-        self.start_epoch = self.global_step // effective_training_steps
+        self.start_epoch = self.global_step // effective_steps_per_epoch
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
